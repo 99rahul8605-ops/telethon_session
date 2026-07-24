@@ -1,23 +1,26 @@
 """
-Telethon Session String Generator Bot (Advanced / Inline-button edition)
--------------------------------------------------------------------------
+Telegram Session String Generator Bot (Telethon + Pyrogram edition)
+----------------------------------------------------------------------
 Flow:
-1. /start -> sends a stylish welcome message with an inline "Generate Session"
-   button.
-2. Tapping the button starts the flow: asks for API_ID, with an inline
-   "Skip (use default)" button for users who don't want to provide their own
-   API_ID/API_HASH (requires the bot owner to configure defaults).
-3. If not skipped -> asks for API_HASH.
-4. Asks for the phone number.
-5. Sends an OTP to that number via Telegram.
-6. Asks the user to enter the OTP with a SPACE between every digit
+1. /start -> sends a stylish welcome message with an inline
+   "Generate Session" button.
+2. Tapping the button lets the user choose which library to generate the
+   session string for: Telethon or Pyrogram.
+3. Asks for API_ID, with an inline "Skip (use default)" button for users who
+   don't want to provide their own API_ID/API_HASH (requires the bot owner to
+   configure defaults).
+4. If not skipped -> asks for API_HASH.
+5. Asks for the phone number.
+6. Sends an OTP to that number via Telegram.
+7. Asks the user to enter the OTP with a SPACE between every digit
    (e.g. "1 2 3 4 5") — this prevents Telegram's client from auto
    invalidating the code when it detects a raw login-code pattern being
    forwarded/pasted into a chat.
-7. If the account has Two-Step Verification (2FA) enabled, asks for the
+8. If the account has Two-Step Verification (2FA) enabled, asks for the
    password.
-8. Generates the Telethon StringSession and sends it to the user, then
-   cleans up the temporary client.
+9. Generates the session string (Telethon StringSession or Pyrogram session
+   string, depending on what the user picked) and sends it, then cleans up
+   the temporary client.
 
 Run:
     pip install -r requirements.txt
@@ -35,6 +38,8 @@ generates.
 
 import logging
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import (
     InlineKeyboardButton,
@@ -51,16 +56,28 @@ from telegram.ext import (
     filters,
 )
 
+# ---- Telethon ----
 from telethon import TelegramClient
 from telethon.errors import (
     ApiIdInvalidError,
-    FloodWaitError,
-    PasswordHashInvalidError,
-    PhoneCodeInvalidError,
-    PhoneNumberInvalidError,
-    SessionPasswordNeededError,
+    FloodWaitError as TelethonFloodWaitError,
+    PasswordHashInvalidError as TelethonPasswordHashInvalidError,
+    PhoneCodeInvalidError as TelethonPhoneCodeInvalidError,
+    PhoneNumberInvalidError as TelethonPhoneNumberInvalidError,
+    SessionPasswordNeededError as TelethonSessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
+
+# ---- Pyrogram ----
+from pyrogram import Client as PyrogramClient
+from pyrogram.errors import (
+    ApiIdInvalid as PyroApiIdInvalid,
+    FloodWait as PyroFloodWait,
+    PasswordHashInvalid as PyroPasswordHashInvalid,
+    PhoneCodeInvalid as PyroPhoneCodeInvalid,
+    PhoneNumberInvalid as PyroPhoneNumberInvalid,
+    SessionPasswordNeeded as PyroSessionPasswordNeeded,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -72,13 +89,36 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DEFAULT_API_ID = os.environ.get("DEFAULT_API_ID")
 DEFAULT_API_HASH = os.environ.get("DEFAULT_API_HASH")
 
+# Render (and most PaaS providers) expect a Web Service to bind to $PORT and
+# respond to HTTP requests, otherwise the deploy is marked unhealthy/failed —
+# even though this bot doesn't actually need to serve web traffic. This tiny
+# server exists purely to satisfy that port-detection / health-check.
+PORT = int(os.environ.get("PORT", 8080))
+
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - Session Generator Bot is running")
+
+    def log_message(self, format, *args):  # noqa: A002 - silence default access logs
+        pass
+
+
+def start_health_server() -> None:
+    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    logger.info("Health check server listening on 0.0.0.0:%s", PORT)
+    server.serve_forever()
+
 # Conversation states
-MENU, API_ID, API_HASH, PHONE, OTP, PASSWORD = range(6)
+MENU, CHOOSE_LIB, API_ID, API_HASH, PHONE, OTP, PASSWORD = range(7)
 
 WELCOME_TEXT = (
     "✨ *Welcome to Session Generator Bot* ✨\n\n"
-    "🔐 I can generate a secure *Telethon Session String* for your Telegram "
-    "account in just a few simple steps.\n\n"
+    "🔐 I can generate a secure *session string* for your Telegram account "
+    "in just a few simple steps — your choice of *Telethon* or *Pyrogram*.\n\n"
     "⚡ *What you get:*\n"
     "  •  Fast & guided setup\n"
     "  •  Safe OTP handling\n"
@@ -93,11 +133,89 @@ def generate_button() -> InlineKeyboardMarkup:
     )
 
 
+def library_buttons() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🐍 Telethon", callback_data="lib_telethon"),
+                InlineKeyboardButton("🔥 Pyrogram", callback_data="lib_pyrogram"),
+            ]
+        ]
+    )
+
+
 def skip_button() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("⏭️ Skip (use default)", callback_data="skip_api")]]
     )
 
+
+LIB_LABELS = {"telethon": "🐍 Telethon", "pyrogram": "🔥 Pyrogram"}
+
+
+# --------------------------------------------------------------------------
+# Library-agnostic helpers: each returns/accepts a plain (client) object and
+# hides whether we're driving Telethon or Pyrogram underneath.
+# --------------------------------------------------------------------------
+
+async def create_and_send_code(lib: str, api_id: int, api_hash: str, phone: str):
+    """Connect a fresh client and request a login code. Returns (client, phone_code_hash)."""
+    if lib == "telethon":
+        client = TelegramClient(StringSession(), api_id, api_hash)
+        await client.connect()
+        sent = await client.send_code_request(phone)
+        return client, sent.phone_code_hash
+    else:  # pyrogram
+        client = PyrogramClient(
+            name="temp_session", api_id=api_id, api_hash=api_hash, in_memory=True
+        )
+        await client.connect()
+        sent = await client.send_code(phone)
+        return client, sent.phone_code_hash
+
+
+async def sign_in_with_code(lib: str, client, phone: str, code: str, phone_code_hash: str):
+    if lib == "telethon":
+        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+    else:  # pyrogram
+        await client.sign_in(
+            phone_number=phone, phone_code_hash=phone_code_hash, phone_code=code
+        )
+
+
+async def sign_in_with_password(lib: str, client, password: str):
+    if lib == "telethon":
+        await client.sign_in(password=password)
+    else:  # pyrogram
+        await client.check_password(password)
+
+
+async def export_session_string(lib: str, client) -> str:
+    if lib == "telethon":
+        return client.session.save()
+    else:  # pyrogram
+        return await client.export_session_string()
+
+
+async def disconnect_client(lib: str, client):
+    try:
+        if lib == "telethon":
+            await client.disconnect()
+        else:
+            await client.disconnect()
+    except Exception:
+        pass
+
+
+def flood_wait_seconds(lib: str, error) -> int:
+    if lib == "telethon":
+        return error.seconds
+    return getattr(error, "value", 0)
+
+
+# --------------------------------------------------------------------------
+# Handlers
+# --------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -109,10 +227,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return MENU
 
 
-async def ask_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def choose_library(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
+        "🧰 *Choose a library*\n\n"
+        "Which library do you want the session string for?",
+        parse_mode="Markdown",
+        reply_markup=library_buttons(),
+    )
+    return CHOOSE_LIB
+
+
+async def lib_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    lib = "telethon" if query.data == "lib_telethon" else "pyrogram"
+    context.user_data["lib"] = lib
+
+    await query.edit_message_text(
+        f"✅ Library selected: *{LIB_LABELS[lib]}*\n\n"
         "🧩 *Step 1/4 — API Credentials*\n\n"
         "Please send your *API_ID*.\n"
         "Don't have one? Get it free at my.telegram.org, or tap *Skip* below "
@@ -175,38 +309,34 @@ async def get_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     phone = update.message.text.strip()
+    lib = context.user_data["lib"]
     api_id = context.user_data["api_id"]
     api_hash = context.user_data["api_hash"]
 
     status_msg = await update.message.reply_text("⏳ Sending OTP, please wait...")
 
-    client = TelegramClient(StringSession(), api_id, api_hash)
-    await client.connect()
-
     try:
-        sent = await client.send_code_request(phone)
-    except ApiIdInvalidError:
+        client, phone_code_hash = await create_and_send_code(lib, api_id, api_hash, phone)
+    except (ApiIdInvalidError, PyroApiIdInvalid):
         await status_msg.edit_text(
             "❌ Invalid API_ID/API_HASH combination. Send /start to try again."
         )
-        await client.disconnect()
         return ConversationHandler.END
-    except PhoneNumberInvalidError:
+    except (TelethonPhoneNumberInvalidError, PyroPhoneNumberInvalid):
         await status_msg.edit_text(
             "❌ That phone number looks invalid. Please send it again with country code."
         )
-        await client.disconnect()
         return PHONE
-    except FloodWaitError as e:
+    except (TelethonFloodWaitError, PyroFloodWait) as e:
+        seconds = flood_wait_seconds(lib, e)
         await status_msg.edit_text(
-            f"⏳ Too many attempts. Telegram asks you to wait {e.seconds}s, then /start again."
+            f"⏳ Too many attempts. Telegram asks you to wait {seconds}s, then /start again."
         )
-        await client.disconnect()
         return ConversationHandler.END
 
     context.user_data["client"] = client
     context.user_data["phone"] = phone
-    context.user_data["phone_code_hash"] = sent.phone_code_hash
+    context.user_data["phone_code_hash"] = phone_code_hash
 
     await status_msg.edit_text(
         "📩 *Step 3/4 — Enter OTP*\n\n"
@@ -232,20 +362,21 @@ async def get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return OTP
 
-    client: TelegramClient = context.user_data["client"]
+    lib = context.user_data["lib"]
+    client = context.user_data["client"]
     phone = context.user_data["phone"]
     phone_code_hash = context.user_data["phone_code_hash"]
 
     try:
-        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-    except PhoneCodeInvalidError:
+        await sign_in_with_code(lib, client, phone, code, phone_code_hash)
+    except (TelethonPhoneCodeInvalidError, PyroPhoneCodeInvalid):
         await update.message.reply_text(
             "❌ Incorrect code. Please resend it with spaces between digits, "
             "e.g. `1 2 3 4 5`",
             parse_mode="Markdown",
         )
         return OTP
-    except SessionPasswordNeededError:
+    except (TelethonSessionPasswordNeededError, PyroSessionPasswordNeeded):
         await update.message.reply_text(
             "🔒 *Step 4/4 — Two-Step Verification*\n\n"
             "Your account has 2FA enabled. Please send your password.",
@@ -258,11 +389,12 @@ async def get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     password = update.message.text
-    client: TelegramClient = context.user_data["client"]
+    lib = context.user_data["lib"]
+    client = context.user_data["client"]
 
     try:
-        await client.sign_in(password=password)
-    except PasswordHashInvalidError:
+        await sign_in_with_password(lib, client, password)
+    except (TelethonPasswordHashInvalidError, PyroPasswordHashInvalid):
         await update.message.reply_text("❌ Wrong password. Please send it again.")
         return PASSWORD
 
@@ -270,12 +402,13 @@ async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    client: TelegramClient = context.user_data["client"]
-    session_string = client.session.save()
+    lib = context.user_data["lib"]
+    client = context.user_data["client"]
+    session_string = await export_session_string(lib, client)
 
     await update.message.reply_text(
         "🎉 *Login Successful!*\n\n"
-        "Here is your Telethon session string:\n\n"
+        f"Here is your *{LIB_LABELS[lib]}* session string:\n\n"
         f"`{session_string}`\n\n"
         "⚠️ *Keep this secret* — anyone with this string has full access to "
         "your account. Never share it publicly.\n\n"
@@ -283,15 +416,16 @@ async def finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         parse_mode="Markdown",
     )
 
-    await client.disconnect()
+    await disconnect_client(lib, client)
     context.user_data.clear()
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     client = context.user_data.get("client")
-    if client:
-        await client.disconnect()
+    lib = context.user_data.get("lib")
+    if client and lib:
+        await disconnect_client(lib, client)
     context.user_data.clear()
     await update.message.reply_text("🚫 Cancelled. Send /start to begin again.")
     return ConversationHandler.END
@@ -306,7 +440,10 @@ def main() -> None:
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            MENU: [CallbackQueryHandler(ask_api_id, pattern="^generate$")],
+            MENU: [CallbackQueryHandler(choose_library, pattern="^generate$")],
+            CHOOSE_LIB: [
+                CallbackQueryHandler(lib_selected, pattern="^lib_(telethon|pyrogram)$")
+            ],
             API_ID: [
                 CallbackQueryHandler(skip_api, pattern="^skip_api$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, get_api_id),
@@ -320,6 +457,11 @@ def main() -> None:
     )
 
     app.add_handler(conv)
+
+    # Start the health-check HTTP server in a background thread so Render
+    # can detect an open port, while the bot itself keeps polling Telegram.
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     logger.info("Bot started. Polling...")
     app.run_polling()
 
