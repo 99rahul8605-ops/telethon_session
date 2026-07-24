@@ -36,10 +36,21 @@ infrastructure you trust — the bot itself will see every session string it
 generates.
 """
 
+import asyncio
 import logging
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# Python 3.14 removed asyncio's implicit "create a loop if none exists"
+# behavior (asyncio.get_event_loop() now raises instead). Pyrogram's
+# sync.py calls asyncio.get_event_loop() at import time, which crashes the
+# whole process on 3.14+ unless a loop already exists in this thread. This
+# creates one up front so the import succeeds regardless of Python version.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 from telegram import (
     InlineKeyboardButton,
