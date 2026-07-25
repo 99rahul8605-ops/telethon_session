@@ -225,11 +225,102 @@ def flood_wait_seconds(lib: str, error) -> int:
 
 
 # --------------------------------------------------------------------------
+# OTP timeout: if the user doesn't enter the code within 5 minutes, the
+# in-progress login is reset for security (a half-finished Telegram login
+# left open indefinitely is a bad idea).
+# --------------------------------------------------------------------------
+
+OTP_TIMEOUT_SECONDS = 5 * 60
+
+
+def _otp_job_name(user_id: int) -> str:
+    return f"otp_timeout_{user_id}"
+
+
+def cancel_otp_timeout(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    if not context.job_queue:
+        return
+    for job in context.job_queue.get_jobs_by_name(_otp_job_name(user_id)):
+        job.schedule_removal()
+
+
+def schedule_otp_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> None:
+    if not context.job_queue:
+        logger.warning("job_queue is not available — OTP timeout will not be enforced.")
+        return
+    cancel_otp_timeout(context, user_id)
+    context.job_queue.run_once(
+        otp_timeout_job,
+        when=OTP_TIMEOUT_SECONDS,
+        chat_id=chat_id,
+        user_id=user_id,
+        name=_otp_job_name(user_id),
+    )
+
+
+async def otp_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_data = context.user_data
+    client = user_data.get("client") if user_data else None
+    lib = user_data.get("lib") if user_data else None
+
+    if client and lib:
+        await disconnect_client(lib, client)
+    if user_data:
+        user_data.clear()
+
+    await context.bot.send_message(
+        chat_id=context.job.chat_id,
+        text=(
+            "⏰ *Session Expired*\n\n"
+            "You didn't enter the OTP within 5 minutes, so this session "
+            "generation has been reset for your account's security.\n\n"
+            "Send /start to begin again."
+        ),
+        parse_mode="Markdown",
+    )
+
+
+async def abort_and_restart(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, reason: str
+) -> int:
+    """Disconnects any in-progress client, wipes state, and tells the user to
+    /start over. Used for every 'wrong input' case: bad OTP, bad 2FA
+    password, invalid API_ID/API_HASH, etc."""
+    user_id = update.effective_user.id
+    cancel_otp_timeout(context, user_id)
+
+    client = context.user_data.get("client")
+    lib = context.user_data.get("lib")
+    if client and lib:
+        await disconnect_client(lib, client)
+    context.user_data.clear()
+
+    text = (
+        f"❌ *{reason}*\n\n"
+        "For your account's security, this session generation has been reset.\n\n"
+        "Send /start to begin again."
+    )
+    if update.message:
+        await update.message.reply_text(text, parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(text, parse_mode="Markdown")
+
+    return ConversationHandler.END
+
+
+# --------------------------------------------------------------------------
 # Handlers
 # --------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Clean up anything left over from a previous, abandoned attempt.
+    old_client = context.user_data.get("client")
+    old_lib = context.user_data.get("lib")
+    if old_client and old_lib:
+        await disconnect_client(old_lib, old_client)
+    cancel_otp_timeout(context, update.effective_user.id)
     context.user_data.clear()
+
     await update.message.reply_text(
         WELCOME_TEXT,
         parse_mode="Markdown",
@@ -330,8 +421,12 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         client, phone_code_hash = await create_and_send_code(lib, api_id, api_hash, phone)
     except (ApiIdInvalidError, PyroApiIdInvalid):
         await status_msg.edit_text(
-            "❌ Invalid API_ID/API_HASH combination. Send /start to try again."
+            "❌ *Invalid API_ID / API_HASH*\n\n"
+            "For your account's security, this session generation has been reset.\n\n"
+            "Send /start to begin again.",
+            parse_mode="Markdown",
         )
+        context.user_data.clear()
         return ConversationHandler.END
     except (TelethonPhoneNumberInvalidError, PyroPhoneNumberInvalid):
         await status_msg.edit_text(
@@ -343,11 +438,15 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await status_msg.edit_text(
             f"⏳ Too many attempts. Telegram asks you to wait {seconds}s, then /start again."
         )
+        context.user_data.clear()
         return ConversationHandler.END
 
     context.user_data["client"] = client
     context.user_data["phone"] = phone
     context.user_data["phone_code_hash"] = phone_code_hash
+
+    # Reset if the OTP isn't entered within 5 minutes.
+    schedule_otp_timeout(context, update.effective_chat.id, update.effective_user.id)
 
     await status_msg.edit_text(
         "📩 *Step 3/4 — Enter OTP*\n\n"
@@ -355,13 +454,21 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "⚠️ *Important:* To stop Telegram from auto-invalidating the code, "
         "type it back with a *space between every digit*.\n\n"
         "Example — if the code is `12345`, send it as:\n"
-        "`1 2 3 4 5`",
+        "`1 2 3 4 5`\n\n"
+        "⏳ You have *5 minutes* to enter it, after which this session "
+        "generation will automatically reset.",
         parse_mode="Markdown",
     )
     return OTP
 
 
 async def get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if "client" not in context.user_data:
+        await update.message.reply_text(
+            "⚠️ This session generation has expired or was reset. Send /start to begin again."
+        )
+        return ConversationHandler.END
+
     raw = update.message.text.strip()
     code = raw.replace(" ", "")
 
@@ -381,13 +488,9 @@ async def get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         await sign_in_with_code(lib, client, phone, code, phone_code_hash)
     except (TelethonPhoneCodeInvalidError, PyroPhoneCodeInvalid):
-        await update.message.reply_text(
-            "❌ Incorrect code. Please resend it with spaces between digits, "
-            "e.g. `1 2 3 4 5`",
-            parse_mode="Markdown",
-        )
-        return OTP
+        return await abort_and_restart(update, context, "Wrong OTP entered")
     except (TelethonSessionPasswordNeededError, PyroSessionPasswordNeeded):
+        cancel_otp_timeout(context, update.effective_user.id)
         await update.message.reply_text(
             "🔒 *Step 4/4 — Two-Step Verification*\n\n"
             "Your account has 2FA enabled. Please send your password.",
@@ -395,10 +498,17 @@ async def get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return PASSWORD
 
+    cancel_otp_timeout(context, update.effective_user.id)
     return await finish(update, context)
 
 
 async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if "client" not in context.user_data:
+        await update.message.reply_text(
+            "⚠️ This session generation has expired or was reset. Send /start to begin again."
+        )
+        return ConversationHandler.END
+
     password = update.message.text
     lib = context.user_data["lib"]
     client = context.user_data["client"]
@@ -406,13 +516,13 @@ async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     try:
         await sign_in_with_password(lib, client, password)
     except (TelethonPasswordHashInvalidError, PyroPasswordHashInvalid):
-        await update.message.reply_text("❌ Wrong password. Please send it again.")
-        return PASSWORD
+        return await abort_and_restart(update, context, "Wrong 2FA password entered")
 
     return await finish(update, context)
 
 
 async def finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cancel_otp_timeout(context, update.effective_user.id)
     lib = context.user_data["lib"]
     client = context.user_data["client"]
     session_string = await export_session_string(lib, client)
@@ -433,6 +543,7 @@ async def finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cancel_otp_timeout(context, update.effective_user.id)
     client = context.user_data.get("client")
     lib = context.user_data.get("lib")
     if client and lib:
@@ -464,7 +575,10 @@ def main() -> None:
             OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_otp)],
             PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_password)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+        ],
     )
 
     app.add_handler(conv)
