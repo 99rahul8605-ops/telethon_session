@@ -35,7 +35,10 @@ generated for. Never share it publicly, and only run this bot on
 infrastructure you trust — the bot itself will see every session string it
 generates.
 """
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
 import asyncio
 import logging
 import os
