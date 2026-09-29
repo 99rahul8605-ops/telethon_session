@@ -3,3 +3,5 @@ pyrogram>=2.0.106
 tgcrypto>=1.2.5
 python-telegram-bot[job-queue]>=20.7
 python-dotenv
+
+fastapi>=0.115

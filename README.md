@@ -37,7 +37,7 @@ bhi chalata hai jo sirf `200 OK` return karta hai:
   process bilkul normal chalti rahe.
 - Render dashboard me:
   - **Service type:** Web Service
-  - **Health Check Path:** `/`
+  - **Health Check Path:** `/health`
   - Build command: `pip install -r requirements.txt`
   - Start command: `python bot.py`
   - Environment variables: `BOT_TOKEN` (aur optionally `DEFAULT_API_ID`,
@@ -46,6 +46,23 @@ bhi chalata hai jo sirf `200 OK` return karta hai:
 Agar tum Render par **Background Worker** service type use karte ho (jo port
 bind nahi maangta), to yeh health server harm nahi karega — bas thread me
 chalta rahega, chahe koi usko hit kare ya na kare.
+
+### UptimeRobot
+
+Create an **HTTP(s)** monitor with this URL:
+
+```text
+https://YOUR-SERVICE-NAME.onrender.com/health
+```
+
+The endpoint supports both `GET` and `HEAD` and returns HTTP `200` with:
+
+```json
+{"status":"ok","service":"telegram-session-bot"}
+```
+
+Before adding it to UptimeRobot, open the `/health` URL once in a browser. If it
+returns the JSON above, the monitor has a valid HTTP target.
 
 ## Notes on Pyrogram
 
@@ -83,3 +100,20 @@ python bot.py
   ya cancel hone par client disconnect ho jata hai.
 - Production me deploy karte waqt, in-memory `user_data` ke bajaye persistent/secure
   storage aur rate-limiting add karna consider karo agar bahut users honge.
+
+## Vercel note
+
+`api/index.py` now exports a top-level FastAPI `app`, so Vercel can detect the
+Python entrypoint successfully.
+
+However, the Telegram session-generator flow in `bot.py` uses long-running
+polling and keeps a live Telethon/Pyrogram login client in memory between the
+phone, OTP and 2FA steps. Vercel Functions are stateless/ephemeral, so the
+actual bot should be run on an always-on process host with:
+
+```bash
+python bot.py
+```
+
+Use Vercel only for the included HTTP entrypoint/health endpoint, not for the
+polling bot process itself.
