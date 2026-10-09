@@ -174,7 +174,7 @@ WELCOME_TEXT = (
     "  •  Safe OTP handling\n"
     "  •  Full 2FA support\n\n"
     "Tap the button below to begin 👇\n\n"
-    "📦 Already have a Server 1 bulk session ZIP? Send /read"
+    "📦 Send /read to read ZIP file."
 )
 
 
@@ -617,16 +617,19 @@ def _reader_credentials_ok() -> bool:
     return READER_API_ID.isdigit() and bool(READER_API_HASH)
 
 
-def _reader_keyboard(phone: str, include_stop: bool = False) -> InlineKeyboardMarkup:
-    rows = [[
+def _reader_keyboard(phone: str) -> InlineKeyboardMarkup:
+    """Buttons shown only after an OTP has actually been received."""
+    return InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Request New OTP", callback_data=f"read_rereq:{phone}"),
         InlineKeyboardButton("📱 Manage Sessions", callback_data=f"read_sessions:{phone}"),
-    ]]
-    if include_stop:
-        rows.append([
-            InlineKeyboardButton("⏹ Stop Batch", callback_data="read_stop")
-        ])
-    return InlineKeyboardMarkup(rows)
+    ]])
+
+
+def _reader_waiting_keyboard() -> InlineKeyboardMarkup:
+    """Before OTP arrival, do not expose session-management controls."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏹ Stop Batch", callback_data="read_stop")
+    ]])
 
 
 def _reader_manifest_from_text(text: str):
@@ -806,7 +809,7 @@ async def _reader_send_current(user_id: int):
             "As soon as its OTP arrives, I will send the OTP + 2FA and then "
             "automatically send the next number.",
             parse_mode="HTML",
-            reply_markup=_reader_keyboard(phone, include_stop=True),
+            reply_markup=_reader_waiting_keyboard(),
         )
         return
 
@@ -907,11 +910,8 @@ async def reader_read_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["reader_waiting_zip"] = True
     await update.message.reply_text(
-        "📎 <b>Send your Server 1 Bulk Session ZIP</b>\n\n"
-        "Required package format:\n"
-        "• <code>accounts.txt</code>\n"
-        "• one numeric <code>.session</code> file per number\n\n"
-        "The bot will process one number at a time.",
+        "📎 <b>Send ZIP file</b>\n\n"
+        "The bot will process the numbers one at a time.",
         parse_mode="HTML",
     )
 
@@ -925,7 +925,7 @@ async def reader_zip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     filename = document.file_name or ""
     if not filename.lower().endswith(".zip"):
-        await update.message.reply_text("❌ Please send the Server 1 .zip package.")
+        await update.message.reply_text("❌ Please send a ZIP file.")
         return
     if document.file_size and document.file_size > READER_MAX_ZIP_BYTES:
         await update.message.reply_text("❌ ZIP file is too large.")
@@ -963,9 +963,11 @@ async def reader_zip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _reader_send_current(user_id)
     except zipfile.BadZipFile:
         await status.edit_text("❌ Invalid ZIP file.")
-    except Exception as exc:
+    except Exception:
         logger.exception("Reader ZIP load failed")
-        await status.edit_text(f"❌ Could not load package: {exc}")
+        await status.edit_text(
+            "❌ Could not read this ZIP file. Please send a valid ZIP file."
+        )
     finally:
         shutil.rmtree(download_dir, ignore_errors=True)
 
