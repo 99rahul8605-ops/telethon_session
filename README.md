@@ -150,4 +150,14 @@ If these are empty, the reader falls back to `DEFAULT_API_ID` / `DEFAULT_API_HAS
 
 ### ZIP reuse
 
-Stopping/cancelling the reader or using **Disconnect Reader Only** does not revoke Telegram authorization, so the same original ZIP can be uploaded again. If the user chooses **Logout Reader Session**, Telegram revokes that authorization permanently and that account inside the old ZIP will no longer work.
+Stopping/cancelling the reader or using **Disconnect Reader Only** does not revoke Telegram authorization, so the same original ZIP can be uploaded again. Before reusing the same ZIP, disconnect the reader connection first; do not run the same ZIP simultaneously in multiple reader instances. If the user chooses **Logout Reader Session**, Telegram revokes that authorization permanently and that account inside the old ZIP will no longer work.
+
+
+## Reader auto-disconnect
+
+Reader connections automatically disconnect locally after 10 minutes. This does not revoke Telegram authorization. The same original ZIP can be uploaded again with `/read` to reconnect. A `Disconnect Reader` button is shown immediately after ZIP upload and while waiting for OTP.
+
+
+## Skip number
+
+While waiting for an OTP, the user can tap **Skip Number**. The reader disconnects that number locally, marks it skipped, and immediately moves to the next number in the ZIP.

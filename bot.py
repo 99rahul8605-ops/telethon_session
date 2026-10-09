@@ -120,6 +120,9 @@ READER_API_HASH = (os.environ.get("READER_API_HASH") or DEFAULT_API_HASH or "").
 READER_MAX_ACCOUNTS = max(2, int(os.environ.get("READER_MAX_ACCOUNTS", "50")))
 READER_MAX_ZIP_BYTES = int(os.environ.get("READER_MAX_ZIP_BYTES", str(50 * 1024 * 1024)))
 READER_MAX_UNCOMPRESSED_BYTES = int(os.environ.get("READER_MAX_UNCOMPRESSED_BYTES", str(120 * 1024 * 1024)))
+READER_AUTO_DISCONNECT_SECONDS = max(
+    60, int(os.environ.get("READER_AUTO_DISCONNECT_SECONDS", "600"))
+)
 
 
 # Render (and most PaaS providers) expect a Web Service to bind to $PORT and
@@ -603,6 +606,7 @@ reader_account_manager = None
 reader_batches = {}      # user_id -> in-memory batch state
 reader_locks = {}        # user_id -> asyncio.Lock
 reader_last_otp = {}     # (user_id, phone) -> (otp, timestamp)
+reader_auto_disconnect_tasks = {}  # user_id -> asyncio.Task
 
 
 def _reader_normalize_phone(value: str) -> str:
@@ -618,17 +622,37 @@ def _reader_credentials_ok() -> bool:
 
 
 def _reader_keyboard(phone: str) -> InlineKeyboardMarkup:
-    """Buttons shown only after an OTP has actually been received."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Request New OTP", callback_data=f"read_rereq:{phone}"),
-        InlineKeyboardButton("📱 Manage Sessions", callback_data=f"read_sessions:{phone}"),
-    ]])
+    """OTP controls; session management appears only after OTP arrival."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Request New OTP", callback_data=f"read_rereq:{phone}"),
+            InlineKeyboardButton("📱 Manage Sessions", callback_data=f"read_sessions:{phone}"),
+        ],
+        [
+            InlineKeyboardButton("🔌 Disconnect Reader", callback_data="read_disconnect_all")
+        ],
+    ])
 
 
 def _reader_waiting_keyboard() -> InlineKeyboardMarkup:
-    """Before OTP arrival, do not expose session-management controls."""
+    """Before OTP arrival: allow skip/disconnect, but no Manage Sessions."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⏭️ Skip Number", callback_data="read_skip")
+        ],
+        [
+            InlineKeyboardButton("🔌 Disconnect Reader", callback_data="read_disconnect_all")
+        ],
+        [
+            InlineKeyboardButton("⏹ Stop Batch", callback_data="read_stop")
+        ],
+    ])
+
+
+def _reader_loaded_keyboard() -> InlineKeyboardMarkup:
+    """Shown immediately after the ZIP has been accepted."""
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⏹ Stop Batch", callback_data="read_stop")
+        InlineKeyboardButton("🔌 Disconnect Reader", callback_data="read_disconnect_all")
     ]])
 
 
@@ -721,19 +745,71 @@ def _reader_unpack_zip(zip_path: str, user_id: int):
         raise
 
 
-async def _reader_cleanup_user(user_id: int):
+def _reader_cancel_auto_disconnect(user_id: int):
+    user_id = int(user_id)
+    task = reader_auto_disconnect_tasks.pop(user_id, None)
+    if task and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+
+
+async def _reader_cleanup_user(user_id: int, *, cancel_timer: bool = True):
     global reader_account_manager
     user_id = int(user_id)
+
+    if cancel_timer:
+        _reader_cancel_auto_disconnect(user_id)
+
     batch = reader_batches.pop(user_id, None)
+
     if reader_account_manager:
         await reader_account_manager.remove_owner(user_id)
+
     if batch:
         temp_dir = batch.get("temp_dir")
         if temp_dir:
             shutil.rmtree(str(temp_dir), ignore_errors=True)
+
     for key in list(reader_last_otp):
         if key[0] == user_id:
             reader_last_otp.pop(key, None)
+
+
+async def _reader_auto_disconnect_job(user_id: int, batch_id: str):
+    user_id = int(user_id)
+    try:
+        await asyncio.sleep(READER_AUTO_DISCONNECT_SECONDS)
+
+        batch = reader_batches.get(user_id)
+        if not batch or batch.get("batch_id") != batch_id:
+            return
+
+        await _reader_cleanup_user(user_id, cancel_timer=False)
+
+        if reader_application:
+            minutes = max(1, READER_AUTO_DISCONNECT_SECONDS // 60)
+            await reader_application.bot.send_message(
+                user_id,
+                "🔌 <b>Reader Disconnected</b>\n\n"
+                f"The reader automatically disconnected after <b>{minutes} minutes</b>.\n"
+                "Telegram authorization was not revoked. "
+                "Send <code>/read</code> and upload the same ZIP again whenever you want to reconnect.",
+                parse_mode="HTML",
+            )
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Reader auto-disconnect failed user=%s", user_id)
+    finally:
+        current = reader_auto_disconnect_tasks.get(user_id)
+        if current is asyncio.current_task():
+            reader_auto_disconnect_tasks.pop(user_id, None)
+
+
+def _reader_schedule_auto_disconnect(user_id: int, batch_id: str):
+    _reader_cancel_auto_disconnect(user_id)
+    reader_auto_disconnect_tasks[int(user_id)] = asyncio.create_task(
+        _reader_auto_disconnect_job(int(user_id), str(batch_id))
+    )
 
 
 async def _reader_ensure_loaded(user_id: int, phone: str):
@@ -807,7 +883,9 @@ async def _reader_send_current(user_id: int):
             f"📱 Number: <code>{phone}</code>\n\n"
             "Request the Telegram login code for this number now.\n"
             "As soon as its OTP arrives, I will send the OTP + 2FA and then "
-            "automatically send the next number.",
+            "automatically send the next number.\n\n"
+            "⏱ <b>Reader auto-disconnects after 10 minutes.</b> "
+            "You can upload the same ZIP again to reconnect.",
             parse_mode="HTML",
             reply_markup=_reader_waiting_keyboard(),
         )
@@ -866,7 +944,12 @@ async def reader_otp_callback(*, owner_id, phone, otp, twofa_password=None):
         )
         if twofa:
             msg += f"\n🔐 2FA: <code>{twofa}</code>"
-        msg += "\n\nKeep these details private."
+        msg += (
+            "\n\nKeep these details private."
+            "\n\n🔌 <b>Reader disconnects automatically after 10 minutes.</b> "
+            "If you want to reuse the same ZIP before that, tap <b>Disconnect Reader</b> first. "
+            "After disconnect, send <code>/read</code> and upload the same ZIP again to reconnect."
+        )
 
         await reader_application.bot.send_message(
             owner_id,
@@ -943,8 +1026,9 @@ async def reader_zip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         temp_dir, items = _reader_unpack_zip(str(zip_path), user_id)
 
         await _reader_cleanup_user(user_id)
+        batch_id = uuid.uuid4().hex
         reader_batches[user_id] = {
-            "batch_id": uuid.uuid4().hex,
+            "batch_id": batch_id,
             "temp_dir": str(temp_dir),
             "source_name": filename,
             "items": items,
@@ -954,11 +1038,16 @@ async def reader_zip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "pending_rerequest": set(),
         }
 
+        _reader_schedule_auto_disconnect(user_id, batch_id)
+
         await status.edit_text(
-            "✅ <b>Session ZIP Loaded</b>\n\n"
+            "✅ <b>ZIP Loaded</b>\n\n"
             f"Accounts: <b>{len(items)}</b>\n"
-            "Starting Number 1...",
+            "Starting Number 1...\n\n"
+            "⏱ <b>Session will disconnect automatically after 10 minutes.</b>\n"
+            "After disconnect, you can send <code>/read</code> and upload the same ZIP again.",
             parse_mode="HTML",
+            reply_markup=_reader_loaded_keyboard(),
         )
         await _reader_send_current(user_id)
     except zipfile.BadZipFile:
@@ -1076,6 +1165,54 @@ async def reader_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("❌ Reader batch expired. Upload the ZIP again with /read.")
         return
 
+    if data == "read_skip":
+        batch = reader_batches.get(user_id)
+        if not batch or batch.get("status") != "active":
+            await query.message.reply_text("❌ No active number to skip.")
+            return
+
+        idx = int(batch.get("index", 0) or 0)
+        items = batch.get("items", [])
+        phone = _reader_normalize_phone(batch.get("current_phone") or "")
+
+        if idx >= len(items) or not phone:
+            await query.message.reply_text("❌ No active number to skip.")
+            return
+
+        item = items[idx]
+        item["status"] = "skipped"
+        batch.setdefault("pending_rerequest", set()).discard(phone)
+        batch["current_phone"] = None
+        batch["index"] = idx + 1
+
+        if reader_account_manager:
+            await reader_account_manager.remove_client(user_id, phone)
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await query.message.reply_text(
+            f"⏭️ <b>Skipped</b>\n\n"
+            f"📱 <code>{phone}</code>\n"
+            "Moving to the next number...",
+            parse_mode="HTML",
+        )
+
+        await _reader_send_current(user_id)
+        return
+
+    if data == "read_disconnect_all":
+        await _reader_cleanup_user(user_id)
+        await query.message.reply_text(
+            "🔌 <b>Reader Disconnected</b>\n\n"
+            "All reader connections were closed locally. Telegram authorization was not revoked.\n"
+            "Send <code>/read</code> and upload the same ZIP again whenever you want to reconnect.",
+            parse_mode="HTML",
+        )
+        return
+
     if data == "read_stop":
         await _reader_cleanup_user(user_id)
         await query.message.reply_text(
@@ -1170,8 +1307,14 @@ async def reader_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def reader_shutdown(application):
+    for task in list(reader_auto_disconnect_tasks.values()):
+        if task and not task.done():
+            task.cancel()
+    reader_auto_disconnect_tasks.clear()
+
     if reader_account_manager:
         await reader_account_manager.stop_all()
+
     for batch in list(reader_batches.values()):
         temp_dir = batch.get("temp_dir")
         if temp_dir:
