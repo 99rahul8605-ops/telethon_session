@@ -117,3 +117,37 @@ python bot.py
 
 Use Vercel only for the included HTTP entrypoint/health endpoint, not for the
 polling bot process itself.
+
+---
+
+## Server 1 Bulk Session ZIP Reader
+
+This build also supports the independent reader flow:
+
+1. Send `/read`.
+2. Upload the exact **Server 1 Bulk Session Package** ZIP produced by the OTP panel.
+3. The package must contain `accounts.txt` beginning with `Bulk Session Delivery` plus numeric `.session` files.
+4. The reader opens the first session, shows Number 1, and listens for Telegram service messages from `777000`.
+5. When an OTP arrives, it sends **Number + OTP + 2FA + Request New OTP + Manage Sessions**, then automatically moves to the next number.
+6. Re-request on an older number only forwards that number's next OTP; it does not disturb the main queue.
+7. Manage Sessions can terminate other Telegram device sessions or permanently log out the reader session.
+8. **Disconnect Reader Only** closes the local client without revoking Telegram authorization, so the original ZIP remains reusable.
+
+Reader commands:
+
+- `/read`
+- `/readstatus`
+- `/cancelread`
+
+Reader environment:
+
+```env
+READER_API_ID=
+READER_API_HASH=
+```
+
+If these are empty, the reader falls back to `DEFAULT_API_ID` / `DEFAULT_API_HASH`.
+
+### ZIP reuse
+
+Stopping/cancelling the reader or using **Disconnect Reader Only** does not revoke Telegram authorization, so the same original ZIP can be uploaded again. If the user chooses **Logout Reader Session**, Telegram revokes that authorization permanently and that account inside the old ZIP will no longer work.

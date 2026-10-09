@@ -12,3 +12,8 @@ services:
         sync: false
       - key: DEFAULT_API_HASH
         sync: false
+
+      - key: READER_API_ID
+        sync: false
+      - key: READER_API_HASH
+        sync: false
