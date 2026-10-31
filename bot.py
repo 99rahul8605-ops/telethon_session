@@ -696,21 +696,30 @@ def _reader_unpack_zip(zip_path: str, user_id: int):
             if total > READER_MAX_UNCOMPRESSED_BYTES:
                 raise ValueError("ZIP is too large after extraction.")
 
+            # accounts.txt / account.txt is OPTIONAL.
+            #  - With manifest    : order + 2FA come from the file.
+            #  - Without manifest : every .session file in the ZIP is used
+            #                       (sorted by phone), 2FA = None.
             manifest_info = next(
-                (info for info in infos if Path(info.filename).name.casefold() == "accounts.txt"),
+                (
+                    info for info in infos
+                    if Path(info.filename).name.casefold() in {"accounts.txt", "account.txt"}
+                ),
                 None,
             )
-            if not manifest_info:
-                raise ValueError("accounts.txt is missing from the ZIP.")
-            if manifest_info.file_size > 512 * 1024:
-                raise ValueError("accounts.txt is unexpectedly large.")
 
-            manifest_text = zf.read(manifest_info).decode("utf-8", errors="replace")
-            order, twofa_by_phone = _reader_manifest_from_text(manifest_text)
+            order, twofa_by_phone = [], {}
+            if manifest_info:
+                if manifest_info.file_size > 512 * 1024:
+                    raise ValueError("accounts.txt is unexpectedly large.")
+                manifest_text = zf.read(manifest_info).decode("utf-8", errors="replace")
+                order, twofa_by_phone = _reader_manifest_from_text(manifest_text)
 
             session_infos = {}
             for info in infos:
                 base = Path(info.filename).name
+                if base.startswith(".") or "__MACOSX" in info.filename:
+                    continue
                 if not base.lower().endswith(".session"):
                     continue
                 if info.file_size <= 0 or info.file_size > 10 * 1024 * 1024:
@@ -719,6 +728,9 @@ def _reader_unpack_zip(zip_path: str, user_id: int):
                 if not phone:
                     continue
                 session_infos.setdefault(phone, info)
+
+            if not manifest_info:
+                order = sorted(session_infos)
 
             items = []
             for phone in order:
@@ -737,7 +749,9 @@ def _reader_unpack_zip(zip_path: str, user_id: int):
                     break
 
             if not items:
-                raise ValueError("No matching .session files were found for accounts.txt.")
+                raise ValueError(
+                    "No matching .session files were found in the ZIP."
+                )
 
             return temp_dir, items
     except Exception:
@@ -1052,6 +1066,8 @@ async def reader_zip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _reader_send_current(user_id)
     except zipfile.BadZipFile:
         await status.edit_text("❌ Invalid ZIP file.")
+    except ValueError as exc:
+        await status.edit_text(f"❌ {exc}")
     except Exception:
         logger.exception("Reader ZIP load failed")
         await status.edit_text(
